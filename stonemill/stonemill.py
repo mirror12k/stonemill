@@ -253,7 +253,8 @@ RUN apt-get update && apt-get install -y gnupg software-properties-common curl \
   && dpkg -i session-manager-plugin.deb \\
   && rm session-manager-plugin.deb
 
-RUN pip install weasel-make
+# optional: install development utilities
+RUN pip install stonemill weasel-make llm-shell
 
 # safety measure to drop privileges to lowly user
 RUN useradd -ms /bin/bash runuser
