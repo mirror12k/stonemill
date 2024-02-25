@@ -315,6 +315,7 @@ if [[ "$AWS_MFA_DEVICE_ARN" != "null" ]]; then
     exit
 else
     echo "no mfa device found, configuring with fixed credentials"
+    echo "  warning: you will not be able to call any IAM apis with these credentials!"
 
     AWS_CREDS=$(aws sts get-session-token --duration-seconds 7200)
     AWS_ACCESS_KEY_ID=$(echo "$AWS_CREDS" | jq -r ".Credentials.AccessKeyId")
