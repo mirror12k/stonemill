@@ -772,7 +772,7 @@ source my_venv/bin/activate
 pip install --upgrade --ignore-installed -r requirements.txt
 deactivate
 
-rm -rf modules __pycache__ xml-test-reports
+rm -rf modules __pycache__ xml-test-reports .coverage
 mkdir modules
 # ls -la my_venv/lib/*/site-packages/
 rm -rf my_venv/lib/*/site-packages/*.dist-info \\
@@ -966,6 +966,45 @@ api_lambda_test = Definition("scripts/test.sh", append=True, text='''
 INVOKE_URL=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{lambda_name}}_api_url.value')
 echo "invoking api: $INVOKE_URL"
 curl -X POST "$INVOKE_URL/{{lambda_name}}/hello" -H 'content-type: application/json' -d '{"msg":"working as intended"}'
+''')
+api_lambda_unit_test = Definition("src/{{lambda_name}}/unit_test.py", text='''#!/usr/bin/env python3
+import sys
+sys.path.append('modules')
+import os
+import json
+import unittest
+import xmlrunner
+import coverage
+
+cov = coverage.Coverage()
+cov.start()
+
+print('[i] injecting testing env variables...')
+os.environ['API_AUTHORIZATION_SECRET_KEY'] = 'test_key'
+os.environ['API_DOMAIN_NAME'] = 'test.local'
+
+print('[i] importing runtime modules...')
+import routes
+print('[+] import successful')
+
+class LambdaUnitTests(unittest.TestCase):
+  def test_hello(self):
+    res = routes.hello({'msg': 'asdf'}, {})
+    self.assertEqual(res, {'success': True, 'msg': 'asdf'})
+    res = routes.hello({}, {})
+    self.assertFalse(res['success'])
+    self.assertEqual(res, {'success': False, 'error': 'missing argument'})
+
+class _LambdaCoverageTest(unittest.TestCase):
+  def test_coverage(self):
+    cov.stop()
+    cov.json_report(['routes.py'], outfile='/tmp/cov.json')
+    with open('/tmp/cov.json', 'r') as f:
+      data = json.loads(f.read())
+    print('[i] total coverage percent:', data['totals']['percent_covered'])
+    self.assertGreaterEqual(data['totals']['percent_covered'], 75.0)
+
+unittest.main(testRunner=xmlrunner.XMLTestRunner(output='xml-test-reports'))
 ''')
 
 
@@ -4194,6 +4233,7 @@ Use the following command to tail logs in cli:
 
 api_lambda_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name': r"^[a-zA-Z_][a-zA-Z0-9_]+$" }, [
   api_lambda_definition,
+  graphql_lambda_makefile,
   base_lambda_makefile,
   api_lambda_module,
   base_lambda_main,
@@ -4202,6 +4242,7 @@ api_lambda_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name'
   base_lambda_build,
   base_lambda_requirements,
   api_lambda_test,
+  api_lambda_unit_test,
 ], '''
 api lambda scaffolded...
 build the lambda package with `weasel build_{lambda_name}`
