@@ -1728,6 +1728,47 @@ print(res)
 ''')
 
 
+authn_lambda_definition = base_lambda_definition.but_replace('''METRICS_GROUP = local.metrics_group''', '''METRICS_GROUP = local.metrics_group
+      API_AUTHORIZATION_SECRET_KEY = random_id.api_authorization_random_secret.hex
+      API_DOMAIN_NAME = var.domain_name''').but_replace('''resource "aws_lambda_function" "lambda_function" {''', '''
+resource "random_id" "api_authorization_random_secret" { byte_length = 64 }
+resource "aws_lambda_function" "lambda_function" {''').but_replace('''variable "lambda_build_path" { type = string }''', '''variable "lambda_build_path" { type = string }
+variable "domain_name" { type = string }''')
+authn_lambda_module = base_lambda_module.but_replace('''lambda_build_path = var.{{lambda_name}}_build_path''', '''lambda_build_path = var.{{lambda_name}}_build_path
+  domain_name = local.domain_name
+''')
+authn_lambda_routes = Definition("src/{{lambda_name}}/routes.py", text='''from lambda_routing import *
+from authorization import *
+
+@lambda_route('/v1/authn_lambda/sign_token')
+@with_arguments('id')
+def sign_token(data, event):
+  print('debug:', data['id'])
+  return { 'success': True, 'token': sign_jwt_authorization(data['id'], 'user') }
+
+@lambda_route('/v1/authn_lambda/verify_token')
+@with_arguments('token')
+def verify_token(data, event):
+  jwt_data = verify_jwt_authorization(data['token'])
+  if jwt_data is not None:
+    return { 'success': True, 'data': jwt_data }
+  else:
+    return { 'success': False, 'error': 'invalid token' }
+''')
+authn_lambda_test = Definition("scripts/test.sh", append=True, text='''
+INVOKE_FUNCTION_NAME=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{lambda_name}}_name.value')
+aws lambda invoke --region us-east-1 \\
+    --function-name "$INVOKE_FUNCTION_NAME" \\
+    --payload $(echo '{"rawPath":"/v1/authn_lambda/sign_token","body":"{\\"id\\":\\"asdf\\"}"}' | base64 -w 0) \\
+    output.json
+TOKEN=$(cat output.json | jq -r '.token')
+aws lambda invoke --region us-east-1 \\
+    --function-name "$INVOKE_FUNCTION_NAME" \\
+    --payload $(echo '{"rawPath":"/v1/authn_lambda/verify_token","body":"{\\"token\\":\\"'$TOKEN'\\"}"}' | base64 -w 0) \\
+    /dev/stdout
+''')
+
+
 website_s3_module = Definition("infrastructure/main.tf", append=True, text='''
 variable "{{website_name}}_build_path" { default = "../src/{{website_name}}/dist" }
 
@@ -4199,7 +4240,6 @@ base_lambda_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name
 ], '''
 basic lambda scaffolded...
 build the lambda package with `weasel build_{lambda_name}`
-tail logs by using `aws logs tail /aws/lambda/MYLAMBDA_NAME --follow --region us-east-1 &`
 ''', '''
 
 test your lambda by invoking:
@@ -4226,7 +4266,6 @@ graphql_lambda_template = TemplateDefinition('{lambda_name} gql lambda', { 'lamb
 ], '''
 graphql lambda scaffolded...
 build the lambda package with `weasel build_{lambda_name}`
-tail logs by using `aws logs tail /aws/lambda/MYLAMBDA_NAME --follow --region us-east-1 &`
 ''', '''
 
 test your graphql lambda by invoking:
@@ -4255,7 +4294,6 @@ api_lambda_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name'
 ], '''
 api lambda scaffolded...
 build the lambda package with `weasel build_{lambda_name}`
-tail logs by using `aws logs tail /aws/lambda/MYLAMBDA_NAME --follow --region us-east-1 &`
 test the lambda by executing `./scripts/test.sh`
 
 Use the following command to tail logs in cli:
@@ -4277,7 +4315,6 @@ api_graphql_lambda_template = TemplateDefinition('{lambda_name} gql lambda', { '
 ], '''
 api lambda scaffolded...
 build the lambda package with `weasel build_{lambda_name}`
-tail logs by using `aws logs tail /aws/lambda/MYLAMBDA_NAME --follow --region us-east-1 &`
 test the lambda by executing `./scripts/test.sh`
 
 Use the following command to tail logs in cli:
@@ -4298,7 +4335,6 @@ sqs_lambda_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name'
 ], '''
 sqs lambda scaffolded...
 build the lambda package with `weasel build_{lambda_name}`
-tail logs by using `aws logs tail /aws/lambda/MYLAMBDA_NAME --follow --region us-east-1 &`
 test the lambda by executing `./scripts/test.sh`
 
 Use the following command to tail logs in cli:
@@ -4527,6 +4563,60 @@ enjoy responsibly...
 ''', fixed_args={ 'hash_key': 'id' })
 
 
+authn_lambda_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name': r"^[a-zA-Z_][a-zA-Z0-9_]+$" }, [
+  authn_lambda_definition,
+  base_lambda_makefile,
+  authn_lambda_module,
+  base_lambda_main,
+  graphql_lambda_authorization,
+  base_lambda_lib,
+  authn_lambda_routes,
+  base_lambda_build,
+  base_lambda_requirements,
+  authn_lambda_test,
+], '''
+authn lambda scaffolded...
+build the lambda package with `weasel build_{lambda_name}`
+''', '''
+test your lambda with: ./scripts/test.sh
+
+Use the following command to tail logs in cli:
+  aws logs tail /aws/lambda/<LAMBDA_FULL_NAME> --follow --region us-east-1 &
+''')
+
+singleton_crud_ddb_table_template = TemplateDefinition('{lambda_name} lambda', {
+  'lambda_name': r"^[a-zA-Z_][a-zA-Z0-9_]+$",
+  'table_name': r"^[a-zA-Z_][a-zA-Z0-9_]+$",
+}, [
+  authn_lambda_definition,
+  authn_lambda_module,
+  authn_lambda_routes,
+], '''
+singleton CRUD dynamodb table scaffolded...
+graphql endpoint additions added to {table_name} lambda...
+test the crud apis by executing `./scripts/test.sh`
+
+''', '''
+remember to add to the policy the following:
+{
+  "Effect" = "Allow",
+  "Action" = [
+    "dynamodb:GetItem",
+    "dynamodb:PutItem",
+    "dynamodb:UpdateItem",
+    "dynamodb:DeleteItem",
+    "dynamodb:Scan",
+    "dynamodb:Query"
+  ],
+  "Resource" = [
+    "arn:aws:dynamodb:us-east-1:*:table/${var.arg_table}"
+  ]
+}
+
+enjoy responsibly...
+''', fixed_args={ 'hash_key': 'id' })
+
+
 firehose_s3_template = TemplateDefinition('{firehose_name} firehose', {
   'firehose_name': r"^[a-zA-Z][a-zA-Z0-9]+$",
 }, [
@@ -4634,6 +4724,7 @@ def main():
   parser.add_argument('--sqs-lambda-function', nargs=1, help='creates a py3 lambda with an sqs input queue;\t stonemill --sqs-lambda-function my_lambda')
   parser.add_argument('--gql-lambda-function', nargs=1, help='creates a py3 graphql lambda;\t stonemill --gql-lambda-function my_lambda')
   parser.add_argument('--api-gql-lambda-function', nargs=1, help='creates a py3 graphql lambda with an api gateway;\t stonemill --api-gql-lambda-function my_lambda')
+  parser.add_argument('--authn-lambda', nargs=1, help='creates a py3 lambda;\t stonemill --authn-lambda my_lambda')
   parser.add_argument('--website-s3-bucket', nargs=2, help='creates an s3 bucket for hosting a react site;\t stonemill --website-s3-bucket my_website myspecialfrontend.com')
   parser.add_argument('--ec2-server', nargs=1, help='creates an ec2 server with ssh key;\t stonemill --ec2-server my_server')
   parser.add_argument('--windows-ec2-server', nargs=1, help='creates a windows ec2 server;\t stonemill --windows-ec2-server my_windows_server')
@@ -4689,6 +4780,10 @@ def main():
   elif args.sqs_lambda_function:
     template_args = sqs_lambda_template.parse_arguments(lambda_name = args.sqs_lambda_function[0])
     sqs_lambda_template.mill_template(template_args)
+
+  elif args.authn_lambda:
+    template_args = authn_lambda_template.parse_arguments(lambda_name = args.authn_lambda[0])
+    authn_lambda_template.mill_template(template_args)
 
   elif args.dynamodb_table:
     template_args = dynamodb_table_template.parse_arguments(table_name = args.dynamodb_table[0], hash_key = args.dynamodb_table[1])
