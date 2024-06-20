@@ -790,6 +790,14 @@ boto3
 botocore
 pyjwt
 ''')
+base_lambda_test = Definition("scripts/test.sh", append=True, text='''
+INVOKE_FUNCTION_NAME=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{lambda_name}}_name.value')
+echo "invoking lambda: $INVOKE_FUNCTION_NAME"
+aws lambda invoke --region us-east-1 \\
+    --function-name $INVOKE_FUNCTION_NAME \\
+    --payload $(echo '{"rawPath":"/{{lambda_name}}/hello","body":"{\\"msg\\":\\"yes\\"}"}' | base64 -w 0) \\
+    /dev/stdout
+''')
 
 sqs_lambda_main = base_lambda_main.but_replace('''res = route_request(event)
     print('[r] response:', res)
@@ -4187,6 +4195,7 @@ base_lambda_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name
   base_lambda_routes,
   base_lambda_build,
   base_lambda_requirements,
+  base_lambda_test,
 ], '''
 basic lambda scaffolded...
 build the lambda package with `weasel build_{lambda_name}`
@@ -4196,7 +4205,7 @@ tail logs by using `aws logs tail /aws/lambda/MYLAMBDA_NAME --follow --region us
 test your lambda by invoking:
   aws lambda invoke --region us-east-1 \\
     --function-name <LAMBDA_FULL_NAME> \\
-    --payload $(echo '{ "body": "{\"action\":\"/<LAMBDA_NAME>/hello\"}" }' | base64 -w 0) \\
+    --payload $(echo '{"rawPath":"/<MYLAMBDA_NAME>/hello","body":"{\\"msg\\":\\"yes\\"}"}' | base64 -w 0) \\
     /dev/stdout
 
 Use the following command to tail logs in cli:
