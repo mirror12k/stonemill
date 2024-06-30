@@ -234,24 +234,13 @@ WORKDIR /app
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y gnupg software-properties-common curl \\
-  && curl -fsSL https://apt.releases.hashicorp.com/gpg | apt-key add - \\
-  && apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \\
-  && apt-get update \\
-  && apt-get install -y nano jq zip make \\
-  && apt-get install -y terraform \\
-  && apt-get install -y python3-venv python3-pip \\
-  && apt-get install -y openssh-client \\
-  && apt autoclean \\
-  && apt autoremove \\
-  && apt clean \\
-  && pip install coverage unittest-xml-reporting \\
-  && curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \\
-  && unzip awscliv2.zip \\
-  && ./aws/install \\
-  && rm -rf awscliv2.zip aws \\
-  && curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb" \\
-  && dpkg -i session-manager-plugin.deb \\
-  && rm session-manager-plugin.deb
+  && apt-get install -y nano jq zip make python3-venv python3-pip openssh-client \\
+  && apt autoclean && apt autoremove && apt clean \\
+  && pip install coverage unittest-xml-reporting
+
+# install terraform, awscli, ssm-plugin
+COPY install-tooling.sh .
+RUN ./install-tooling.sh
 
 # optional: install development utilities
 RUN pip install stonemill weasel-make llm-shell
@@ -327,6 +316,64 @@ else
     echo "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" >> .env.temp
     exit
 fi
+''')
+base_install_tooling = Definition("./docker/install-tooling.sh", make_executable=True, text='''#!/bin/bash
+set -e -x
+
+function amd_terraform_install() {
+    curl -fsSL https://apt.releases.hashicorp.com/gpg | apt-key add -
+    apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+    apt-get update
+    apt-get install -y terraform
+}
+function arm_terraform_install() {
+    curl https://releases.hashicorp.com/terraform/1.9.0/terraform_1.9.0_linux_arm64.zip -o "/tmp/terraform.zip"
+    unzip "/tmp/terraform.zip" -d /tmp
+    mv "/tmp/terraform" "/usr/local/bin/terraform"
+    rm "/tmp/terraform.zip"
+}
+
+function amd_awscli_install() {
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip"
+    unzip "/tmp/awscliv2.zip" -d "/tmp"
+    /tmp/aws/install
+    rm -rf "/tmp/awscliv2.zip" "/tmp/aws"
+}
+function arm_awscli_install() {
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o "/tmp/awscliv2.zip"
+    unzip "/tmp/awscliv2.zip" -d "/tmp"
+    /tmp/aws/install
+    rm -rf "/tmp/awscliv2.zip" "/tmp/aws"
+}
+
+function amd_ssm_plugin_install() {
+    curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "/tmp/session-manager-plugin.deb"
+    dpkg -i "/tmp/session-manager-plugin.deb"
+    rm "/tmp/session-manager-plugin.deb"
+}
+function arm_ssm_plugin_install() {
+    curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_arm64/session-manager-plugin.deb" -o "/tmp/session-manager-plugin.deb"
+    dpkg -i "/tmp/session-manager-plugin.deb"
+    rm "/tmp/session-manager-plugin.deb"
+}
+
+arch=$(uname -m)
+case "$arch" in
+    x86_64 | i686 | i386 )
+        amd_terraform_install
+        amd_awscli_install
+        amd_ssm_plugin_install
+        ;;
+    arm64 | aarch64 )
+        arm_terraform_install
+        arm_awscli_install
+        arm_ssm_plugin_install
+        ;;
+    * )
+        echo "Unsupported CPU architecture: $arch"
+        exit 1
+        ;;
+esac
 ''')
 base_create_keys = Definition("./infrastructure/tools/create-keys.sh", make_executable=True, text='''#!/bin/bash
 cd "$(dirname "$0")" && cd ../..
@@ -2133,7 +2180,6 @@ curl "$WEBSITE_URL"
 
 ec2_server_module = Definition("infrastructure/main.tf", append=True, text='''
 variable "{{server_name}}_build_path" { default = "../build/{{server_name}}.zip" }
-variable "{{server_name}}_ssh_keypath" { default = "../.keys/{{server_name}}_key" }
 
 module "{{server_name}}" {
   source = "./{{server_name}}"
@@ -2142,7 +2188,6 @@ module "{{server_name}}" {
   infragroup_fullname = local.infragroup_fullname
   sns_alarm_topic_arn = aws_sns_topic.alarm_topic.arn
   package_build_path = var.{{server_name}}_build_path
-  ssh_keypath = var.{{server_name}}_ssh_keypath
   server_config = {}
 }
 
@@ -2154,7 +2199,6 @@ build: build_{{server_name}}_package
 build_{{server_name}}_package:
 \t-mkdir build
 \tcd src && zip ../build/{{server_name}}.zip -FSr {{server_name}}/
-\t./infrastructure/tools/create-keys.sh "{{server_name}}_key"
 ''')
 ec2_server_definition = Definition("infrastructure/{{server_name}}/{{server_name}}.tf", text='''
 variable "infragroup_fullname" { type = string }
@@ -2162,8 +2206,7 @@ variable "sns_alarm_topic_arn" { type = string }
 variable "metrics_path" { type = string }
 
 variable "package_build_path" { type = string }
-variable "ssh_keypath" { type = string }
-variable "ingress_ports" { default = [22] }
+variable "ingress_ports" { default = [] }
 variable "server_config" { default = {} }
 
 locals {
@@ -2177,7 +2220,6 @@ resource "aws_instance" "instance" {
   instance_type = "t2.medium"
 
   security_groups = [aws_security_group.instance_security_group.name]
-  key_name = aws_key_pair.instance_aws_key.id
   iam_instance_profile = aws_iam_instance_profile.instance_profile.id
 
   root_block_device {
@@ -2204,14 +2246,9 @@ resource "aws_instance" "instance" {
   EOT
 }
 
-resource "aws_key_pair" "instance_aws_key" {
-  key_name_prefix = "${local.fullname}-aws_key"
-  public_key = file("${var.ssh_keypath}.pub")
-}
-
 resource "aws_security_group" "instance_security_group" {
   name        = "${local.fullname}-security_group"
-  description = "Allow ssh and standard http/https ports inbound and everything outbound"
+  description = "Security group for ${local.fullname}"
 
   dynamic "ingress" {
     for_each = var.ingress_ports
@@ -2668,7 +2705,6 @@ variable "sns_alarm_topic_arn" { type = string }
 variable "metrics_path" { type = string }
 
 variable "package_build_path" { type = string }
-variable "ssh_keypath" { type = string }
 variable "ingress_ports" { default = [3000] }
 variable "availability_zones" { default = ["us-east-1a", "us-east-1b", "us-east-1c"] }
 variable "server_config" { default = {} }
@@ -2717,16 +2753,11 @@ resource "aws_instance" "instance" {
   EOT
 }
 
-resource "aws_key_pair" "instance_aws_key" {
-  key_name_prefix = "${local.fullname}-aws_key"
-  public_key = file("${var.ssh_keypath}.pub")
-}
-
 resource "aws_security_group" "instance_security_group" {
   vpc_id = aws_vpc.instance_vpc.id
 
   name        = "${local.fullname}-security_group"
-  description = "Allow ssh and standard http/https ports inbound and everything outbound"
+  description = "Security group for ${local.fullname}"
 
   dynamic "ingress" {
     for_each = var.ingress_ports
@@ -3404,8 +3435,7 @@ variable "sns_alarm_topic_arn" { type = string }
 variable "metrics_path" { type = string }
 
 variable "package_build_path" { type = string }
-variable "ssh_keypath" { type = string }
-variable "ingress_ports" { default = [22, 3389] }
+variable "ingress_ports" { default = [3389] }
 variable "server_config" { default = {} }
 
 locals {
@@ -3432,7 +3462,6 @@ resource "aws_instance" "instance" {
   instance_type = "t2.medium"
 
   security_groups = [aws_security_group.instance_security_group.name]
-  key_name = aws_key_pair.instance_aws_key.id
   iam_instance_profile = aws_iam_instance_profile.instance_profile.id
 
   root_block_device {
@@ -3459,14 +3488,9 @@ resource "aws_instance" "instance" {
   # EOT
 }
 
-resource "aws_key_pair" "instance_aws_key" {
-  key_name_prefix = "${local.fullname}-aws_key"
-  public_key = file("${var.ssh_keypath}.pub")
-}
-
 resource "aws_security_group" "instance_security_group" {
   name        = "${local.fullname}-security_group"
-  description = "Allow ssh and standard http/https ports inbound and everything outbound"
+  description = "Security group for ${local.fullname}"
 
   dynamic "ingress" {
     for_each = var.ingress_ports
@@ -4102,6 +4126,7 @@ infra_base_template = TemplateDefinition('{infra_name} infra', {
   base_docker_run,
   base_envfile,
   base_aws_authenticate,
+  base_install_tooling,
   base_create_keys,
   base_deploy,
   base_server_state,
@@ -4146,8 +4171,7 @@ ec2_server_template = TemplateDefinition('{server_name} server', {
 ], '''
 ec2 server scaffolding established...
 build with `weasel build_{server_name}_package`
-your private ssh key will be located at `.keys/{server_name}_key` after the build
-ssh into the server with `./scripts/ssh-into.sh {server_name}` after it is deployed
+Use SSM to login to the server: `./scripts/ssm-into.sh {server_name}`
 ''')
 
 
@@ -4190,7 +4214,7 @@ bastion_ec2_server_template = TemplateDefinition('{server_name} bastion server',
 ], '''
 bastion ec2 server scaffolding established...
 build with `weasel build_{server_name}_package`
-SSH is discouraged with this setup, instead use SSM to login to the server: `./scripts/ssm-into.sh {server_name}`
+Use SSM to login to the server: `./scripts/ssm-into.sh {server_name}`
 
 this server is configured to be protected behind an ALB and a CloudFront distribution, with a strict security group preventing direct access
 keep in mind that ALBs and EC2 servers are expensive to run!
@@ -4726,7 +4750,7 @@ def main():
   parser.add_argument('--api-gql-lambda-function', nargs=1, help='creates a py3 graphql lambda with an api gateway;\t stonemill --api-gql-lambda-function my_lambda')
   parser.add_argument('--authn-lambda', nargs=1, help='creates a py3 lambda;\t stonemill --authn-lambda my_lambda')
   parser.add_argument('--website-s3-bucket', nargs=2, help='creates an s3 bucket for hosting a react site;\t stonemill --website-s3-bucket my_website myspecialfrontend.com')
-  parser.add_argument('--ec2-server', nargs=1, help='creates an ec2 server with ssh key;\t stonemill --ec2-server my_server')
+  parser.add_argument('--ec2-server', nargs=1, help='creates an ec2 server with ssm access;\t stonemill --ec2-server my_server')
   parser.add_argument('--windows-ec2-server', nargs=1, help='creates a windows ec2 server;\t stonemill --windows-ec2-server my_windows_server')
   parser.add_argument('--bastion-ec2-server', nargs=1, help='creates a bastion ec2 server with CF and ALB;\t stonemill --bastion-ec2-server my_bastion')
   parser.add_argument('--dynamodb-table', nargs=2, help='creates a basic dynamodb table;\t stonemill --dynamodb-table my_accounts account_id')
