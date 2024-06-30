@@ -1815,6 +1815,317 @@ aws lambda invoke --region us-east-1 \\
     /dev/stdout
 ''')
 
+base_fargate_server_module = Definition("infrastructure/main.tf", append=True, text='''
+module "{{fargate_server}}" {
+  source = "./{{fargate_server}}"
+  name = "{{fargate_server}}"
+
+  infragroup_fullname = local.infragroup_fullname
+  metrics_path = local.metrics_path
+  sns_alarm_topic_arn = aws_sns_topic.alarm_topic.arn
+}
+
+output "{{fargate_server}}_hostname" { value = module.{{fargate_server}}.alb_hostname }
+output "{{fargate_server}}_url" { value = module.{{fargate_server}}.alb_url }
+''')
+base_fargate_server_app_template = Definition("infrastructure/{{fargate_server}}/app.json.template", text='''[
+  {
+    "name": "${fullname}",
+    "image": "${app_image}",
+    "cpu": ${fargate_cpu},
+    "memory": ${fargate_memory},
+    "networkMode": "awsvpc",
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "${loggroup}",
+        "awslogs-region": "${aws_region}",
+        "awslogs-stream-prefix": "ecs"
+      }
+    },
+    "portMappings": [{
+      "containerPort": ${app_port},
+      "hostPort": ${app_port}
+    }]
+  }
+]''')
+base_fargate_server_network = Definition("infrastructure/{{fargate_server}}/network.tf", text='''
+variable "az_count" { default = 2 }
+
+data "aws_availability_zones" "available" {}
+data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
+data "aws_region" "current" {}
+
+resource "aws_vpc" "main" {
+  cidr_block = "10.1.0.0/16"
+}
+
+# locals {
+#   fargate_cpu
+# }
+
+resource "aws_subnet" "private" {
+  count = var.az_count
+  cidr_block = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index)
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_subnet" "public" {
+  count = var.az_count
+  cidr_block = cidrsubnet(aws_vpc.main.cidr_block, 8, var.az_count + count.index)
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+  vpc_id = aws_vpc.main.id
+  map_public_ip_on_launch = true
+}
+
+resource "aws_internet_gateway" "gw" {
+  vpc_id = aws_vpc.main.id
+}
+
+resource "aws_route" "internet_access" {
+  route_table_id = aws_vpc.main.main_route_table_id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id = aws_internet_gateway.gw.id
+}
+
+resource "aws_eip" "gw_eip" {
+  domain = "vpc"
+}
+
+resource "aws_nat_gateway" "nat_gw" {
+  subnet_id = aws_subnet.public[0].id
+  allocation_id = aws_eip.gw_eip.id
+}
+
+resource "aws_route_table" "private_rt" {
+  count = var.az_count
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat_gw.id
+  }
+}
+
+resource "aws_route_table_association" "private_rt_association" {
+  count = var.az_count
+  subnet_id = element(aws_subnet.private.*.id, count.index)
+  route_table_id = element(aws_route_table.private_rt.*.id, count.index)
+}
+''')
+base_fargate_server_instance = Definition("infrastructure/{{fargate_server}}/instance.tf", text='''
+variable "infragroup_fullname" { type = string }
+variable "metrics_path" { type = string }
+variable "sns_alarm_topic_arn" { type = string }
+
+variable "name" { type = string }
+
+locals {
+  fargate_cpu = 1024
+  fargate_memory = 2048
+  app_port = 3000
+  app_image = "bradfordhamilton/crystal_blockchain:latest"
+
+  fullname = "${var.infragroup_fullname}-${var.name}"
+  metrics_group = "${var.metrics_path}/${var.name}"
+}
+
+
+resource "aws_security_group" "alb_security_group" {
+  name        = "${local.fullname}-alb_security_group"
+  description = "Security group for ${local.fullname} ALB"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = local.app_port
+    to_port     = local.app_port
+    protocol    = "TCP"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+
+resource "aws_security_group" "ecs_task_security_group" {
+  name        = "${local.fullname}-ecs_task_security_group"
+  description = "Security group for ${local.fullname} tasks (allows inbound access from the ALB only)"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = local.app_port
+    to_port     = local.app_port
+    protocol    = "TCP"
+    security_groups = [aws_security_group.alb_security_group.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+
+resource "aws_alb" "main_alb" {
+  name = replace("${var.name}-alb", "_", "-")
+  subnets = aws_subnet.public.*.id
+  security_groups = [aws_security_group.alb_security_group.id]
+}
+
+resource "aws_alb_target_group" "app_target_group" {
+  name = replace(replace("${var.name}-lbtg", "-", ""), "_", "")
+  port = 80
+  protocol = "HTTP"
+  vpc_id = aws_vpc.main.id
+  target_type = "ip"
+
+  health_check {
+    healthy_threshold = 3
+    unhealthy_threshold = 2
+    interval = 30
+    timeout = 3
+    protocol = "HTTP"
+    matcher = "200"
+    path = "/"
+  }
+}
+
+resource "aws_alb_listener" "alb_listener" {
+  load_balancer_arn = aws_alb.main_alb.id
+  port = local.app_port
+  protocol = "HTTP"
+
+  default_action {
+    target_group_arn = aws_alb_target_group.app_target_group.id
+    type = "forward"
+  }
+}
+
+
+resource "aws_ecs_cluster" "main_cluster" {
+  name = "${local.fullname}-ecs_cluster"
+}
+
+data "template_file" "ecs_app_template" {
+  template = file("${path.module}/app.json.template")
+  vars = {
+    fullname = "${local.fullname}-app"
+    loggroup = "/ecs/${local.fullname}-app"
+    app_image = local.app_image
+    app_port = local.app_port
+    fargate_cpu = local.fargate_cpu
+    fargate_memory = local.fargate_memory
+    aws_region = data.aws_region.current.name
+  }
+}
+
+resource "aws_ecs_task_definition" "ecs_task_def" {
+  family = "${local.fullname}-task"
+  execution_role_arn = aws_iam_role.ecs_task_execution_role.arn
+  network_mode = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu = local.fargate_cpu
+  memory = local.fargate_memory
+  container_definitions = data.template_file.ecs_app_template.rendered
+}
+
+resource "aws_ecs_service" "ecs_service" {
+  name = "${local.fullname}-ecs_service"
+  cluster = aws_ecs_cluster.main_cluster.id
+  task_definition = aws_ecs_task_definition.ecs_task_def.arn
+  desired_count = 1
+  launch_type = "FARGATE"
+
+  network_configuration {
+    security_groups = [aws_security_group.ecs_task_security_group.id]
+    subnets = aws_subnet.private.*.id
+    assign_public_ip = true
+  }
+
+  load_balancer {
+    target_group_arn = aws_alb_target_group.app_target_group.id
+    container_name = "${local.fullname}-app"
+    container_port = local.app_port
+  }
+}
+
+output "alb_hostname" { value = aws_alb.main_alb.dns_name }
+output "alb_url" { value = "http://${aws_alb.main_alb.dns_name}:${local.app_port}" }
+
+
+## logs
+
+resource "aws_cloudwatch_log_group" "ecs_log_group" {
+  name = "/ecs/${local.fullname}-app"
+  retention_in_days = 30
+
+  tags = {
+    Name = "${local.fullname}-ecs_log_group"
+  }
+}
+
+## role
+
+data "aws_iam_policy_document" "assume_role_policy" {
+  statement {
+    effect = "Allow"
+    actions = ["sts:AssumeRole"]
+    principals {
+      type = "Service"
+      identifiers = [
+        "ecs-tasks.amazonaws.com"
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role" "ecs_task_execution_role" {
+  name = "${local.fullname}-ecs_task_role"
+  assume_role_policy = data.aws_iam_policy_document.assume_role_policy.json
+}
+
+data "aws_iam_policy_document" "ecs_task_policy_document" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["*"]
+  }
+  statement {
+    effect = "Allow"
+    actions = [
+      "ecr:GetAuthorizationToken",
+      "ecr:BatchCheckLayerAvailability",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:BatchGetImage",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_policy" "ecs_task_policy" {
+  name = "${local.fullname}-ecs_task_policy"
+  policy = data.aws_iam_policy_document.ecs_task_policy_document.json
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_attachment" {
+  role = aws_iam_role.ecs_task_execution_role.name
+  policy_arn = aws_iam_policy.ecs_task_policy.arn
+}
+''')
+
 
 website_s3_module = Definition("infrastructure/main.tf", append=True, text='''
 variable "{{website_name}}_build_path" { default = "../src/{{website_name}}/dist" }
@@ -4608,37 +4919,17 @@ Use the following command to tail logs in cli:
   aws logs tail /aws/lambda/<LAMBDA_FULL_NAME> --follow --region us-east-1 &
 ''')
 
-singleton_crud_ddb_table_template = TemplateDefinition('{lambda_name} lambda', {
-  'lambda_name': r"^[a-zA-Z_][a-zA-Z0-9_]+$",
-  'table_name': r"^[a-zA-Z_][a-zA-Z0-9_]+$",
-}, [
-  authn_lambda_definition,
-  authn_lambda_module,
-  authn_lambda_routes,
+
+base_fargate_server_template = TemplateDefinition('{fargate_server} lambda', { 'fargate_server': r"^[a-zA-Z_][a-zA-Z0-9_]+$" }, [
+  base_fargate_server_module,
+  base_fargate_server_app_template,
+  base_fargate_server_network,
+  base_fargate_server_instance,
 ], '''
-singleton CRUD dynamodb table scaffolded...
-graphql endpoint additions added to {table_name} lambda...
-test the crud apis by executing `./scripts/test.sh`
-
+fargate server scaffolded...
 ''', '''
-remember to add to the policy the following:
-{
-  "Effect" = "Allow",
-  "Action" = [
-    "dynamodb:GetItem",
-    "dynamodb:PutItem",
-    "dynamodb:UpdateItem",
-    "dynamodb:DeleteItem",
-    "dynamodb:Scan",
-    "dynamodb:Query"
-  ],
-  "Resource" = [
-    "arn:aws:dynamodb:us-east-1:*:table/${var.arg_table}"
-  ]
-}
-
-enjoy responsibly...
-''', fixed_args={ 'hash_key': 'id' })
+connect to it via the server url after deploying.
+''')
 
 
 firehose_s3_template = TemplateDefinition('{firehose_name} firehose', {
@@ -4753,6 +5044,7 @@ def main():
   parser.add_argument('--ec2-server', nargs=1, help='creates an ec2 server with ssm access;\t stonemill --ec2-server my_server')
   parser.add_argument('--windows-ec2-server', nargs=1, help='creates a windows ec2 server;\t stonemill --windows-ec2-server my_windows_server')
   parser.add_argument('--bastion-ec2-server', nargs=1, help='creates a bastion ec2 server with CF and ALB;\t stonemill --bastion-ec2-server my_bastion')
+  parser.add_argument('--fargate-server', nargs=1, help='creates a fargate server with an ALB;\t stonemill --fargate-server my_application')
   parser.add_argument('--dynamodb-table', nargs=2, help='creates a basic dynamodb table;\t stonemill --dynamodb-table my_accounts account_id')
   parser.add_argument('--indexed-dynamodb-table', nargs=2, help='creates a dynamodb table with a global secondary index;\t stonemill --indexed-dynamodb-table my_accounts account_id email')
   parser.add_argument('--usermanager-ddb-table', nargs=2, help='creates a users dynamodb table with graphql endpoints for addUser and login;\n\t uses strong password salting and hashing for security;\t stonemill --usermanager-ddb-table my_lambda users')
@@ -4828,6 +5120,10 @@ def main():
   elif args.singleton_crud_ddb_table:
     template_args = singleton_crud_ddb_table_template.parse_arguments(lambda_name = args.crud_ddb_table[0], table_name = args.crud_ddb_table[1])
     singleton_crud_ddb_table_template.mill_template(template_args)
+
+  elif args.fargate_server:
+    template_args = base_fargate_server_template.parse_arguments(firehose_name = args.fargate_server[0])
+    base_fargate_server_template.mill_template(template_args)
 
   elif args.firehose_s3:
     template_args = firehose_s3_template.parse_arguments(firehose_name = args.firehose_s3[0])
