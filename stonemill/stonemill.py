@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import stat
 import sys
@@ -383,6 +384,40 @@ if [[ ! -f ".keys/$KEYPATH" ]]; then
   mkdir -p .keys/
   ssh-keygen -m PEM -t rsa -b 2048 -f ".keys/$KEYPATH" -q -N ""
 fi
+''')
+base_trigger_codebuild = Definition("./infrastructure/tools/trigger-codebuild.sh", make_executable=True, text='''#!/bin/bash
+set -e
+cd "$(dirname "$0")" && cd ../..
+
+CODEBUILD_PROJECT_NAME="$1"
+aws codebuild start-build --project-name "$CODEBUILD_PROJECT_NAME" --region us-east-1 > /dev/null
+
+CODEBUILD_PROJECT_NAMES="$CODEBUILD_PROJECT_NAME"
+COUNT_PROJECT="$CODEBUILD_PROJECT_NAMES"
+
+# get the number of completed builds
+function get_codebuild_project_status {
+  for project_name in $CODEBUILD_PROJECT_NAMES
+  do
+    # get project id from name
+    project_id=$(aws codebuild list-builds-for-project --project-name "$project_name" --region us-east-1 | jq -r '.ids[0]')
+    # get build status
+    aws codebuild batch-get-builds --ids "$project_id" --region us-east-1 | jq -r '.builds[].phases[] | select(.phaseType=="COMPLETED") | .phaseType'
+  done
+}
+
+# check if deployment is finished
+function codebuild_project_await_status {
+  while [[ ${#PROJECT_STATUS[@]} != ${#COUNT_PROJECT[@]} ]]
+  do
+    # echo "completed: ${#PROJECT_STATUS[@]}/${#COUNT_PROJECT[@]}"
+    PROJECT_STATUS=($(get_codebuild_project_status))
+  done
+}
+
+# aws logs tail "$CODEBUILD_PROJECT_OUTPUT" --follow &
+codebuild_project_await_status
+# pkill -P $$
 ''')
 base_deploy = Definition("./infrastructure/tools/deploy.sh", make_executable=True, text='''#!/bin/bash
 set -e
@@ -1813,6 +1848,177 @@ aws lambda invoke --region us-east-1 \\
     --function-name "$INVOKE_FUNCTION_NAME" \\
     --payload $(echo '{"rawPath":"/v1/authn_lambda/verify_token","body":"{\\"token\\":\\"'$TOKEN'\\"}"}' | base64 -w 0) \\
     /dev/stdout
+''')
+
+base_ecr_image_definition = Definition("infrastructure/{{lambda_name}}/{{lambda_name}}_image.tf", text='''
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+resource "aws_ecr_repository" "lambda_image_repo" {
+  name = "${local.fullname}/{{lambda_name}}"
+  image_tag_mutability = "MUTABLE"
+  force_delete = true
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+resource "random_id" "deploy_bucket_random_id" { byte_length = 24 }
+resource "aws_s3_bucket" "package_bucket" {
+  bucket = "packagebucket-${random_id.deploy_bucket_random_id.hex}"
+  force_destroy = true
+}
+
+resource "aws_s3_object" "package_file" {
+  bucket = aws_s3_bucket.package_bucket.id
+  key = "package.zip"
+  source = var.lambda_build_path
+  etag = filemd5(var.lambda_build_path)
+}
+
+resource "null_resource" "codebuild_project_build_trigger" {
+  provisioner "local-exec" {
+    command = "./tools/trigger-codebuild.sh '${aws_codebuild_project.codebuild_project.name}'"
+  }
+  lifecycle {
+    replace_triggered_by = [aws_s3_object.package_file]
+  }
+}
+
+resource "aws_codebuild_project" "codebuild_project" {
+  name = "${local.fullname}-image_build_codebuild_project"
+  description = "Codebuild for lambda image"
+  build_timeout = "120"
+  service_role = aws_iam_role.codebuild_pipeline_role.arn
+
+  artifacts {
+    type = "NO_ARTIFACTS"
+  }
+
+  source {
+    type = "S3"
+    location = "${aws_s3_bucket.package_bucket.id}/${aws_s3_object.package_file.key}"
+  }
+
+  environment {
+    privileged_mode = true
+    image = "aws/codebuild/standard:4.0"
+    type = "LINUX_CONTAINER"
+    compute_type = "BUILD_GENERAL1_SMALL"
+
+    dynamic "environment_variable" {
+      for_each = {
+        AWS_ACCOUNT_ID = data.aws_caller_identity.current.account_id
+        AWS_ACCOUNT_REGION = data.aws_region.current.name
+        REPOSITORY_URI = aws_ecr_repository.lambda_image_repo.repository_url
+      }
+      content {
+        name = environment_variable.key
+        value = environment_variable.value
+      }
+    }
+  }
+
+  logs_config {
+    cloudwatch_logs {
+      group_name = "/codebuild/${local.fullname}/image_build_log"
+      stream_name = "image_build_stream"
+    }
+  }
+}
+
+
+resource "aws_iam_role" "codebuild_pipeline_role" {
+  name = "${local.fullname}-codebuild-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "codebuild.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_policy" "codebuild_policy" {
+  name        = "${local.fullname}-codebuild-policy"
+  path        = "/"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ]
+      Resource = "*"
+    }, {
+      Effect = "Allow"
+      Action = "ecr:*"
+      Resource = "*"
+    },
+    {
+      Effect = "Allow"
+      Action = [
+        "s3:GetObject",
+        "codebuild:CreateReportGroup",
+        "codebuild:CreateReport",
+        "codebuild:UpdateReport",
+      ],
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "codebuild_policy_attachment" {
+  role       = aws_iam_role.codebuild_pipeline_role.name
+  policy_arn = aws_iam_policy.codebuild_policy.arn
+}
+
+output "codebuild_project_name" {
+  value = aws_codebuild_project.codebuild_project.name
+  depends_on = [null_resource.codebuild_project_build_trigger]
+}
+
+output "repository_url" {
+  value = aws_ecr_repository.lambda_image_repo.repository_url
+  depends_on = [null_resource.codebuild_project_build_trigger]
+}
+''')
+base_ecr_image_buildspec = Definition("src/{{lambda_name}}/buildspec.yaml", text='''version: 0.2
+phases:
+  pre_build:
+    commands:
+      - echo logging in to Amazon ECR
+      - docker login -u AWS -p $(aws ecr get-login-password --region $AWS_ACCOUNT_REGION) $AWS_ACCOUNT_ID.dkr.ecr.$AWS_ACCOUNT_REGION.amazonaws.com
+  build:
+    commands:
+      - echo build started on `date`
+      - docker build -t $REPOSITORY_URI:latest .
+  post_build:
+    commands:
+      - echo build finished on `date`
+      - docker push $REPOSITORY_URI:latest
+''')
+base_ecr_image_dockerfile = Definition("src/{{lambda_name}}/Dockerfile", text='''FROM public.ecr.aws/lambda/python:3.12
+
+# copy in requirements
+COPY requirements.txt ${LAMBDA_TASK_ROOT}
+# install requirements
+RUN pip install -r requirements.txt
+
+# extra dependencies
+RUN dnf -y install git
+
+# copy function code
+COPY . ${LAMBDA_TASK_ROOT}
+
+# handler
+CMD [ "main.lambda_handler" ]
 ''')
 
 base_fargate_server_module = Definition("infrastructure/main.tf", append=True, text='''
@@ -4439,6 +4645,7 @@ infra_base_template = TemplateDefinition('{infra_name} infra', {
   base_aws_authenticate,
   base_install_tooling,
   base_create_keys,
+  base_trigger_codebuild,
   base_deploy,
   base_server_state,
   base_ssh_into,
@@ -4920,7 +5127,29 @@ Use the following command to tail logs in cli:
 ''')
 
 
-base_fargate_server_template = TemplateDefinition('{fargate_server} lambda', { 'fargate_server': r"^[a-zA-Z_][a-zA-Z0-9_]+$" }, [
+base_ecr_image_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name': r"^[a-zA-Z_][a-zA-Z0-9_]+$" }, [
+  base_ecr_image_definition,
+  base_ecr_image_buildspec,
+  base_ecr_image_dockerfile,
+], '''
+''', '''
+ECR image template added to {lambda_name}...
+Remember to replace your `src/{lambda_name}/build.sh with:
+```
+#!/bin/bash
+zip ../../build/{lambda_name}.zip -FSr .
+```
+
+And in your `infrastructure/{lambda_name}/{lambda_name}.tf`, replace `runtime,handler,filename,source_code_hash` with:
+```
+  package_type = "Image"
+  image_uri = "${aws_ecr_repository.lambda_image_repo.repository_url}:latest"
+  source_code_hash = "1.0"
+```
+''')
+
+
+base_fargate_server_template = TemplateDefinition('{fargate_server} server', { 'fargate_server': r"^[a-zA-Z_][a-zA-Z0-9_]+$" }, [
   base_fargate_server_module,
   base_fargate_server_app_template,
   base_fargate_server_network,
@@ -5040,6 +5269,7 @@ def main():
   parser.add_argument('--gql-lambda-function', nargs=1, help='creates a py3 graphql lambda;\t stonemill --gql-lambda-function my_lambda')
   parser.add_argument('--api-gql-lambda-function', nargs=1, help='creates a py3 graphql lambda with an api gateway;\t stonemill --api-gql-lambda-function my_lambda')
   parser.add_argument('--authn-lambda', nargs=1, help='creates a py3 lambda;\t stonemill --authn-lambda my_lambda')
+  parser.add_argument('--ecr-image-autobuild', nargs=1, help='augments a lambda definition with an ecr-image which auto-builds with codebuild;\n\t defines a dockerfile for you to quickly scaffold complex lambda builds;\n\t stonemill --ecr-image-autobuild my_lambda')
   parser.add_argument('--website-s3-bucket', nargs=2, help='creates an s3 bucket for hosting a react site;\t stonemill --website-s3-bucket my_website myspecialfrontend.com')
   parser.add_argument('--ec2-server', nargs=1, help='creates an ec2 server with ssm access;\t stonemill --ec2-server my_server')
   parser.add_argument('--windows-ec2-server', nargs=1, help='creates a windows ec2 server;\t stonemill --windows-ec2-server my_windows_server')
@@ -5100,6 +5330,10 @@ def main():
   elif args.authn_lambda:
     template_args = authn_lambda_template.parse_arguments(lambda_name = args.authn_lambda[0])
     authn_lambda_template.mill_template(template_args)
+
+  elif args.ecr_image_autobuild:
+    template_args = base_ecr_image_template.parse_arguments(lambda_name = args.ecr_image_autobuild[0])
+    base_ecr_image_template.mill_template(template_args)
 
   elif args.dynamodb_table:
     template_args = dynamodb_table_template.parse_arguments(table_name = args.dynamodb_table[0], hash_key = args.dynamodb_table[1])
