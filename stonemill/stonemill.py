@@ -406,18 +406,51 @@ function get_codebuild_project_status {
   done
 }
 
+# get the number of completed builds
+function did_codebuild_project_fail {
+  for project_name in $CODEBUILD_PROJECT_NAMES
+  do
+    # get project id from name
+    project_id=$(aws codebuild list-builds-for-project --project-name "$project_name" --region us-east-1 | jq -r '.ids[0]')
+    # get build status
+    aws codebuild batch-get-builds --ids "$project_id" --region us-east-1 | jq -r '.builds[].phases[] | select(.phaseStatus=="FAILED") | .phaseType'
+  done
+}
+
+# get the number of completed builds
+function get_codebuild_project_fail_message {
+  for project_name in $CODEBUILD_PROJECT_NAMES
+  do
+    # get project id from name
+    project_id=$(aws codebuild list-builds-for-project --project-name "$project_name" --region us-east-1 | jq -r '.ids[0]')
+    # get build status
+    aws codebuild batch-get-builds --ids "$project_id" --region us-east-1 | jq -r '.builds[].phases[] | select(.phaseStatus=="FAILED") | .contexts[0].message'
+  done
+}
+
 # check if deployment is finished
 function codebuild_project_await_status {
   while [[ ${#PROJECT_STATUS[@]} != ${#COUNT_PROJECT[@]} ]]
   do
     # echo "completed: ${#PROJECT_STATUS[@]}/${#COUNT_PROJECT[@]}"
+    sleep 10
     PROJECT_STATUS=($(get_codebuild_project_status))
   done
+
+
 }
 
 # aws logs tail "$CODEBUILD_PROJECT_OUTPUT" --follow &
 codebuild_project_await_status
 # pkill -P $$
+
+FAILED_PROJECTS=($(did_codebuild_project_fail))
+
+if [[ ${#FAILED_PROJECTS[@]} != 0 ]]; then
+  FAIL_MESSAGES=$(get_codebuild_project_fail_message)
+  echo "got project failures: $FAIL_MESSAGES"
+  exit 1
+fi
 ''')
 base_deploy = Definition("./infrastructure/tools/deploy.sh", make_executable=True, text='''#!/bin/bash
 set -e
@@ -1850,12 +1883,40 @@ aws lambda invoke --region us-east-1 \\
     /dev/stdout
 ''')
 
-base_ecr_image_definition = Definition("infrastructure/{{lambda_name}}/{{lambda_name}}_image.tf", text='''
+base_ecr_image_module = Definition("infrastructure/main.tf", text='''
+module "{{lambda_name}}_image" {
+  source = "./{{lambda_name}}_image"
+
+  name = "{{lambda_name}}_image"
+  metrics_path = local.metrics_path
+  infragroup_fullname = local.infragroup_fullname
+  sns_alarm_topic_arn = aws_sns_topic.alarm_topic.arn
+
+  package_build_path = var.{{lambda_name}}_build_path
+}
+
+# lambda_image_ecr = "${module.{{lambda_name}}_image.repository_url}:latest"
+
+''')
+base_ecr_image_definition = Definition("infrastructure/{{lambda_name}}_image/ecr_image.tf", text='''
+variable "name" { type = string }
+variable "metrics_path" { type = string }
+variable "infragroup_fullname" { type = string }
+variable "sns_alarm_topic_arn" { type = string }
+variable "package_build_path" { type = string }
+
+
+locals {
+  fullname = "${var.infragroup_fullname}-${var.name}"
+  metrics_group = "${var.metrics_path}/${var.name}"
+}
+
+
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 resource "aws_ecr_repository" "lambda_image_repo" {
-  name = "${local.fullname}/{{lambda_name}}"
+  name = "${local.fullname}/image"
   image_tag_mutability = "MUTABLE"
   force_delete = true
 
@@ -1873,8 +1934,8 @@ resource "aws_s3_bucket" "package_bucket" {
 resource "aws_s3_object" "package_file" {
   bucket = aws_s3_bucket.package_bucket.id
   key = "package.zip"
-  source = var.lambda_build_path
-  etag = filemd5(var.lambda_build_path)
+  source = var.package_build_path
+  etag = filemd5(var.package_build_path)
 }
 
 resource "null_resource" "codebuild_project_build_trigger" {
@@ -5128,6 +5189,7 @@ Use the following command to tail logs in cli:
 
 
 base_ecr_image_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name': r"^[a-zA-Z_][a-zA-Z0-9_]+$" }, [
+  base_ecr_image_module,
   base_ecr_image_definition,
   base_ecr_image_buildspec,
   base_ecr_image_dockerfile,
