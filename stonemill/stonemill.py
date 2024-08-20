@@ -5418,7 +5418,7 @@ def main():
     singleton_crud_ddb_table_template.mill_template(template_args)
 
   elif args.fargate_server:
-    template_args = base_fargate_server_template.parse_arguments(firehose_name = args.fargate_server[0])
+    template_args = base_fargate_server_template.parse_arguments(fargate_server = args.fargate_server[0])
     base_fargate_server_template.mill_template(template_args)
 
   elif args.firehose_s3:
