@@ -2193,7 +2193,7 @@ locals {
   fargate_cpu = 1024
   fargate_memory = 2048
   app_port = 3000
-  app_image = "bradfordhamilton/crystal_blockchain:latest"
+  # app_image = "bradfordhamilton/crystal_blockchain:latest"
 
   fullname = "${var.infragroup_fullname}-${var.name}"
   metrics_group = "${var.metrics_path}/${var.name}"
@@ -2287,7 +2287,8 @@ data "template_file" "ecs_app_template" {
   vars = {
     fullname = "${local.fullname}-app"
     loggroup = "/ecs/${local.fullname}-app"
-    app_image = local.app_image
+    # app_image = local.app_image
+    app_image = aws_ecr_repository.lambda_image_repo.repository_url
     app_port = local.app_port
     fargate_cpu = local.fargate_cpu
     fargate_memory = local.fargate_memory
@@ -2391,6 +2392,41 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_attachment" {
   role = aws_iam_role.ecs_task_execution_role.name
   policy_arn = aws_iam_policy.ecs_task_policy.arn
 }
+''')
+base_fargate_dockerfile = Definition("src/{{fargate_server}}/Dockerfile", text='''
+# Use the official Ubuntu image as a base
+FROM ubuntu:latest
+
+# Update the package list and install necessary packages
+RUN apt-get update && \\
+    apt-get install -y apache2 curl unzip && \\
+    apt-get clean
+
+# Create a simple Hello World HTML page
+RUN echo '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>Hello World</title></head><body><h1>Hello World!</h1></body></html>' > /var/www/html/index.html
+
+# Change the default Apache port from 80 to 3000
+RUN sed -i 's/80/3000/g' /etc/apache2/ports.conf /etc/apache2/sites-available/000-default.conf
+
+# Enable mod_rewrite for Apache
+RUN a2enmod rewrite
+
+# Install AWS Systems Manager (SSM) agent
+RUN curl "https://s3.amazonaws.com/amazon-ssm-us-east-1/latest/debian_amd64/amazon-ssm-agent.deb" -o "amazon-ssm-agent.deb" && \\
+    dpkg -i amazon-ssm-agent.deb && \\
+    rm amazon-ssm-agent.deb
+
+# Start the SSM agent and Apache service
+CMD /usr/bin/amazon-ssm-agent & apachectl -D FOREGROUND
+''')
+base_fargate_build = Definition("src/{{fargate_server}}/build.sh", text='''#!/bin/bash
+zip -r ../../build/{{fargate_server}}.zip .
+''')
+base_fargate_makefile = Definition("./Makefile", append=True, text='''
+build: build_{{fargate_server}}
+build_{{fargate_server}}:
+\t-mkdir build
+\tcd src/{{fargate_server}} && bash ./build.sh
 ''')
 
 
@@ -5216,6 +5252,11 @@ base_fargate_server_template = TemplateDefinition('{fargate_server} server', { '
   base_fargate_server_app_template,
   base_fargate_server_network,
   base_fargate_server_instance,
+  base_fargate_dockerfile,
+  base_fargate_build,
+  base_fargate_makefile,
+  Definition(filepath="src/{{fargate_server}}/buildspec.yaml", text=base_ecr_image_buildspec.text),
+  Definition(filepath="infrastructure/{{fargate_server}}/ecr_image.tf", text=base_ecr_image_definition.text),
 ], '''
 fargate server scaffolded...
 ''', '''
