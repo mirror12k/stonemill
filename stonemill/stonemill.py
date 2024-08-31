@@ -1883,7 +1883,7 @@ aws lambda invoke --region us-east-1 \\
     /dev/stdout
 ''')
 
-base_ecr_image_module = Definition("infrastructure/main.tf", text='''
+base_ecr_image_module = Definition("infrastructure/main.tf", append=True, text='''
 module "{{lambda_name}}_image" {
   source = "./{{lambda_name}}_image"
 
