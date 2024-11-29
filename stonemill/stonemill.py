@@ -95,6 +95,25 @@ class Definition(object):
     os.chmod(filepath, new_permissions)
     # print(f"[+] chmod +x {filepath}")
 
+class ReplaceFileDefinition(Definition):
+  def check_file(self, **args):
+    filepath = self.substitute_filepath(**args)
+    if not os.path.exists(filepath) and not self.append_if_not_exist:
+      raise Exception('replace file is missing: ' + filepath)
+  def write_file(self, **args):
+    filepath = self.substitute_filepath(**args)
+    text = self.substitute_text(**args)
+
+    if not os.path.exists(filepath) and self.append_if_not_exist:
+      print('[+] making directory', os.path.dirname(filepath))
+      os.makedirs(os.path.dirname(filepath))
+    print('[+] writing to', filepath)
+    with open(filepath, 'w') as f:
+      f.write(text)
+
+    if self.make_executable:
+      self.add_executable_permission(filepath)
+
 
 class TemplateDefinition(object):
   def __init__(self, message, arguments, definitions, post_message, unformatted_post_message=None, fixed_args={}):
@@ -2074,13 +2093,16 @@ COPY requirements.txt ${LAMBDA_TASK_ROOT}
 RUN pip install -r requirements.txt
 
 # extra dependencies
-RUN dnf -y install git
+# RUN dnf -y install git
 
 # copy function code
 COPY . ${LAMBDA_TASK_ROOT}
 
 # handler
 CMD [ "main.lambda_handler" ]
+''')
+base_ecr_image_build = ReplaceFileDefinition("src/{{lambda_name}}/build.sh", append_if_not_exist=True, text='''#!/bin/bash
+zip ../../build/{{lambda_name}}.zip -FSr .
 ''')
 
 base_fargate_server_module = Definition("infrastructure/main.tf", append=True, text='''
@@ -4922,7 +4944,6 @@ Use the following command to tail logs in cli:
 api_lambda_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_name': r"^[a-zA-Z_][a-zA-Z0-9_]+$" }, [
   api_lambda_definition,
   graphql_lambda_makefile,
-  base_lambda_makefile,
   api_lambda_module,
   base_lambda_main,
   base_lambda_lib,
@@ -5230,20 +5251,15 @@ base_ecr_image_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_n
   base_ecr_image_definition,
   base_ecr_image_buildspec,
   base_ecr_image_dockerfile,
+  base_ecr_image_build,
 ], '''
-''', '''
 ECR image template added to {lambda_name}...
-Remember to replace your `src/{lambda_name}/build.sh with:
-```
-#!/bin/bash
-zip ../../build/{lambda_name}.zip -FSr .
-```
-
-And in your `infrastructure/{lambda_name}/{lambda_name}.tf`, replace `runtime,handler,filename,source_code_hash` with:
+In your `infrastructure/{lambda_name}/{lambda_name}.tf`, replace `runtime,handler,filename,source_code_hash` with:
+''', '''
 ```
   package_type = "Image"
   image_uri = "${aws_ecr_repository.lambda_image_repo.repository_url}:latest"
-  source_code_hash = "1.0"
+  source_code_hash = filebase64sha256(var.lambda_build_path)
 ```
 ''')
 
