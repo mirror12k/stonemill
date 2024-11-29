@@ -2104,6 +2104,9 @@ CMD [ "main.lambda_handler" ]
 base_ecr_image_build = ReplaceFileDefinition("src/{{lambda_name}}/build.sh", append_if_not_exist=True, text='''#!/bin/bash
 zip ../../build/{{lambda_name}}.zip -FSr .
 ''')
+base_ecr_image_module_variable = Definition("infrastructure/{{lambda_name}}/{{lambda_name}}.tf", append=True, text='''
+variable "lambda_image_repo_url" { type = string }
+''')
 
 base_fargate_server_module = Definition("infrastructure/main.tf", append=True, text='''
 module "{{fargate_server}}" {
@@ -5252,13 +5255,20 @@ base_ecr_image_template = TemplateDefinition('{lambda_name} lambda', { 'lambda_n
   base_ecr_image_buildspec,
   base_ecr_image_dockerfile,
   base_ecr_image_build,
+  base_ecr_image_module_variable,
 ], '''
 ECR image template added to {lambda_name}...
-In your `infrastructure/{lambda_name}/{lambda_name}.tf`, replace `runtime,handler,filename,source_code_hash` with:
+
+In your `infrastructure/main.tf`, add the following variable to your lambda module:
+```
+  lambda_image_repo_url = module.{lambda_name}_image
+```
+
+And in your `infrastructure/{lambda_name}/{lambda_name}.tf`, replace `runtime,handler,filename,source_code_hash` with:
 ''', '''
 ```
   package_type = "Image"
-  image_uri = "${aws_ecr_repository.lambda_image_repo.repository_url}:latest"
+  image_uri = "${var.lambda_image_repo_url}:latest"
   source_code_hash = filebase64sha256(var.lambda_build_path)
 ```
 ''')
