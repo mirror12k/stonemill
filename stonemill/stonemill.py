@@ -135,6 +135,7 @@ base_terraform_main = Definition("infrastructure/main.tf", text='''provider "aws
 
   default_tags {
     tags = {
+      Stage = "${var.stage}"
       Project = "${local.infragroup_fullname}"
     }
   }
@@ -572,7 +573,7 @@ INSTANCE_NAME=$1
 if [ "$INSTANCE_NAME" = "" ]; then echo "[!] missing instance name argument!"; exit; fi
 
 echo "[i] getting instance id from infrastructure..."
-INSTANCE_ID=$(cat "infrastructure/terraform.tfstate" | jq -r ".outputs.${INSTANCE_NAME}_instance_id.value")
+INSTANCE_ID=$(terraform -chdir=infrastructure output -json | jq -r ".${INSTANCE_NAME}_instance_id.value")
 if [ "$INSTANCE_ID" = "null" ]; then echo "[!] instance id not found for name '$INSTANCE_NAME'!"; exit; fi
 
 echo "[+] logging in to ssm: $INSTANCE_ID"
@@ -1642,13 +1643,13 @@ from pynamodb.models import Model
 from pynamodb.indexes import GlobalSecondaryIndex, KeysOnlyProjection
 from pynamodb.attributes import UnicodeAttribute, UTCDateTimeAttribute
 
-class {{table_name}}ModelIndex(GlobalSecondaryIndex):
+class {{table_name}}_ModelIndex(GlobalSecondaryIndex):
   class Meta:
     index_name = os.environ.get('{{table_name}}_INDEX')
     projection = KeysOnlyProjection()
   owner_id = UnicodeAttribute(hash_key=True)
 
-class {{table_name}}Model(Model):
+class {{table_name}}_Model(Model):
   class Meta:
     table_name = os.environ.get('{{table_name}}_TABLE')
   id = UnicodeAttribute(hash_key=True)
@@ -1673,12 +1674,12 @@ class Query(ObjectType):
   def resolve_list_{{table_name}}s(root, info):
     results = []
     print("[i] querying dashboards for user:", info.context['parsed_authorization']['id'])
-    for {{table_name}} in {{table_name}}Model.index.query(info.context['parsed_authorization']['id']):
+    for {{table_name}} in {{table_name}}_Model.index.query(info.context['parsed_authorization']['id']):
       results.append({{table_name}}.id)
     print("[+] got dashboards:", results)
     return results
   @authorized('customer')
-  @with_model({{table_name}}Model)
+  @with_model({{table_name}}_Model)
   def resolve_{{table_name}}(root, info, {{table_name}}):
     return {{table_name}}.content
 
@@ -1691,19 +1692,19 @@ class Mutation(ObjectType):
   def resolve_add_{{table_name}}(root, info, content):
     new_id = str(uuid.uuid4())
     print('[i] adding {{table_name}}:', new_id, 'for user:', info.context['parsed_authorization']['id'])
-    {{table_name}} = {{table_name}}Model(new_id, owner_id=info.context['parsed_authorization']['id'], content=content)
+    {{table_name}} = {{table_name}}_Model(new_id, owner_id=info.context['parsed_authorization']['id'], content=content)
     {{table_name}}.save()
     print('[+] {{table_name}} added:', {{table_name}})
     return new_id
   @authorized('customer')
-  @with_model({{table_name}}Model)
+  @with_model({{table_name}}_Model)
   def resolve_update_{{table_name}}(root, info, {{table_name}}, content):
     print("[i] updating {{table_name}}:", {{table_name}}.id)
     {{table_name}}.content = content
     {{table_name}}.save()
     return 'ok'
   @authorized('customer')
-  @with_model({{table_name}}Model)
+  @with_model({{table_name}}_Model)
   def resolve_delete_{{table_name}}(root, info, {{table_name}}):
     print("[i] deleting {{table_name}}:", {{table_name}}.id)
     {{table_name}}.delete()
@@ -1776,7 +1777,7 @@ class Query(ObjectType):
   {{table_name}} = String()
 
   @authorized('customer')
-  @with_singleton_model({{table_name}}Model)
+  @with_singleton_model({{table_name}}_Model)
   def resolve_{{table_name}}(root, info, {{table_name}}):
     return {{table_name}}.content
 
@@ -1786,18 +1787,18 @@ class Mutation(ObjectType):
 
   @authorized('customer')
   def resolve_add_{{table_name}}(root, info, content):
-    existing_model = get_model_by_owner({{table_name}}Model, info.context['parsed_authorization']['id'])
+    existing_model = get_model_by_owner({{table_name}}_Model, info.context['parsed_authorization']['id'])
     if existing_model is not None:
       print('[!] singleton already exists:', existing_model)
       raise Exception('already exists')
     new_id = str(uuid.uuid4())
     print('[i] adding {{table_name}}:', new_id, 'for user:', info.context['parsed_authorization']['id'])
-    {{table_name}} = {{table_name}}Model(new_id, owner_id=info.context['parsed_authorization']['id'], content=content)
+    {{table_name}} = {{table_name}}_Model(new_id, owner_id=info.context['parsed_authorization']['id'], content=content)
     {{table_name}}.save()
     print('[+] {{table_name}} added:', {{table_name}})
     return new_id
   @authorized('customer')
-  @with_singleton_model({{table_name}}Model)
+  @with_singleton_model({{table_name}}_Model)
   def resolve_update_{{table_name}}(root, info, {{table_name}}, content):
     print("[i] updating {{table_name}}:", {{table_name}}.id)
     {{table_name}}.content = content
@@ -5159,7 +5160,7 @@ remember to add to the policy the following:
 }
 
 enjoy responsibly...
-''', fixed_args={ 'hash_key': 'id' })
+''', fixed_args={ 'hash_key': 'id', 'index_key': 'owner_id' })
 
 
 singleton_crud_ddb_table_template = TemplateDefinition('{lambda_name} lambda', {
@@ -5194,7 +5195,7 @@ remember to add to the policy the following:
     "dynamodb:Query"
   ],
   "Resource" = [
-    "arn:aws:dynamodb:us-east-1:*:table/${var.arg_table}"
+    "arn:aws:dynamodb:us-east-1:*:table/${var.arg_table}/*"
   ]
 }
 
@@ -5381,7 +5382,7 @@ def main():
   parser.add_argument('--dynamodb-table', nargs=2, help='creates a basic dynamodb table;\t stonemill --dynamodb-table my_accounts account_id')
   parser.add_argument('--indexed-dynamodb-table', nargs=2, help='creates a dynamodb table with a global secondary index;\t stonemill --indexed-dynamodb-table my_accounts account_id email')
   parser.add_argument('--usermanager-ddb-table', nargs=2, help='creates a users dynamodb table with graphql endpoints for addUser and login;\n\t uses strong password salting and hashing for security;\t stonemill --usermanager-ddb-table my_lambda users')
-  parser.add_argument('--crud-ddb-table', nargs=2, help='creates a dynamodb table with graphql endpoints for Create/Read/Update/Delete/List;\n\t uses uuid4 for ids and has strong authentication on the user;\t stonemill --crud-ddb-table my_lambda my_model')
+  parser.add_argument('--crud-ddb-table', nargs=2, help='creates a dynamodb table with graphql endpoints for Create/Read/Update/Delete/List;\n\t uses uuid4 for ids and has strong authentication on the user;\t stonemill --crud-ddb-table my_lambda my_item')
   parser.add_argument('--singleton-crud-ddb-table', nargs=2, help='creates a dynamodb table with graphql endpoints for Create/Read/Update;\n\t only one singleton exists per user;\n\t uses uuid4 for ids and has strong authentication on the user;\t stonemill --singleton-crud-ddb-table my_lambda my_singleton')
   parser.add_argument('--firehose-s3', nargs=1, help='creates a kinesis firehose that puts to an s3 bucket;\t stonemill --firehose-s3 my_firehose_name')
   parser.add_argument('--s3-bucket', nargs=2, help='creates an s3 bucket in an existing module, with access logging and metrics enabled;\t stonemill --s3-bucket my_lambda data_bucket')
