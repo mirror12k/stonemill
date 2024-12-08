@@ -3,7 +3,7 @@ import os
 
 setup(
    name='stonemill',
-   version='0.1.9',
+   version='0.2.0',
    packages=find_packages(),
    install_requires=[],
    entry_points={

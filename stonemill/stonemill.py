@@ -348,7 +348,7 @@ function amd_terraform_install() {
     apt-get install -y terraform
 }
 function arm_terraform_install() {
-    curl https://releases.hashicorp.com/terraform/1.9.0/terraform_1.9.0_linux_arm64.zip -o "/tmp/terraform.zip"
+    curl https://releases.hashicorp.com/terraform/1.10.1/terraform_1.10.1_linux_arm64.zip -o "/tmp/terraform.zip"
     unzip "/tmp/terraform.zip" -d /tmp
     mv "/tmp/terraform" "/usr/local/bin/terraform"
     rm "/tmp/terraform.zip"
@@ -2109,6 +2109,8 @@ variable "lambda_image_repo_url" { type = string }
 ''')
 
 base_fargate_server_module = Definition("infrastructure/main.tf", append=True, text='''
+variable "{{fargate_server}}_build_path" { default = "../build/{{fargate_server}}.zip" }
+
 module "{{fargate_server}}" {
   source = "./{{fargate_server}}"
   name = "{{fargate_server}}"
@@ -2116,6 +2118,7 @@ module "{{fargate_server}}" {
   infragroup_fullname = local.infragroup_fullname
   metrics_path = local.metrics_path
   sns_alarm_topic_arn = aws_sns_topic.alarm_topic.arn
+  package_build_path = var.{{fargate_server}}_build_path
 }
 
 output "{{fargate_server}}_hostname" { value = module.{{fargate_server}}.alb_hostname }
@@ -5283,7 +5286,25 @@ base_fargate_server_template = TemplateDefinition('{fargate_server} server', { '
   base_fargate_build,
   base_fargate_makefile,
   Definition(filepath="src/{{fargate_server}}/buildspec.yaml", text=base_ecr_image_buildspec.text),
-  Definition(filepath="infrastructure/{{fargate_server}}/ecr_image.tf", text=base_ecr_image_definition.text),
+  Definition(filepath="infrastructure/{{fargate_server}}/ecr_image.tf", text=base_ecr_image_definition.text).but_replace('''
+variable "name" { type = string }
+variable "metrics_path" { type = string }
+variable "infragroup_fullname" { type = string }
+variable "sns_alarm_topic_arn" { type = string }
+variable "package_build_path" { type = string }
+
+
+locals {
+  fullname = "${var.infragroup_fullname}-${var.name}"
+  metrics_group = "${var.metrics_path}/${var.name}"
+}
+
+
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+''', '''
+variable "package_build_path" { type = string }
+'''),
 ], '''
 fargate server scaffolded...
 ''', '''
