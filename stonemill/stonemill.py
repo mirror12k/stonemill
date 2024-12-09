@@ -456,8 +456,6 @@ function codebuild_project_await_status {
     sleep 10
     PROJECT_STATUS=($(get_codebuild_project_status))
   done
-
-
 }
 
 # aws logs tail "$CODEBUILD_PROJECT_OUTPUT" --follow &
@@ -549,6 +547,57 @@ case "$ACTION" in
 esac
 
 echo "[i] done!"
+''')
+base_await_acm_approval = Definition("./infrastructure/tools/await-acm-approval.sh", make_executable=True, text='''#!/bin/bash
+set -e
+cd "$(dirname "$0")" && cd ../..
+
+# Check if an argument (ACM ARN) is provided
+if [ -z "$1" ]; then
+  echo "Usage: $0 <acm-arn>"
+  exit 1
+fi
+
+ACM_ARN=$1
+REGION="us-east-1"
+
+# Fetch and display the domain validation details
+CERT_DETAILS=$(aws acm describe-certificate --certificate-arn "$ACM_ARN" --region "$REGION" --output json)
+DOMAIN_VALIDATION_OPTIONS=$(echo "$CERT_DETAILS" | jq -r '.Certificate.DomainValidationOptions[] | {DomainName, ResourceRecord}')
+DOMAIN_VALIDATION_RECORD=$(echo "$DOMAIN_VALIDATION_OPTIONS" | jq -r '.ResourceRecord.Name')
+DOMAIN_VALIDATION_TYPE=$(echo "$DOMAIN_VALIDATION_OPTIONS" | jq -r '.ResourceRecord.Type')
+DOMAIN_VALIDATION_VALUE=$(echo "$DOMAIN_VALIDATION_OPTIONS" | jq -r '.ResourceRecord.Value')
+
+# Print the domain validation information initially
+echo "Awaiting validation of $DOMAIN_VALIDATION_RECORD -> $DOMAIN_VALIDATION_VALUE ($DOMAIN_VALIDATION_TYPE)"
+
+# Initialize a counter for re-printing the domain information every 50 seconds
+COUNTER=0
+
+# Monitor ACM certificate status
+while true; do
+  # Get the certificate details including validation information
+  CERT_DETAILS=$(aws acm describe-certificate --certificate-arn "$ACM_ARN" --region "$REGION" --output json)
+
+  # Extract the current status of the certificate
+  STATUS=$(echo "$CERT_DETAILS" | jq -r '.Certificate.Status')
+
+  # Check if the certificate is issued
+  if [ "$STATUS" == "ISSUED" ]; then
+    echo "ACM certificate is approved!"
+    break
+  fi
+
+  # Every 50 seconds (i.e., 5 iterations of the 10-second loop), re-print the domain validation information
+  if (( COUNTER % 5 == 4 )); then
+    echo "Awaiting validation of $DOMAIN_VALIDATION_RECORD -> $DOMAIN_VALIDATION_VALUE ($DOMAIN_VALIDATION_TYPE)"
+  fi
+
+  # Post "waiting" and increment the counter
+  # echo "waiting"
+  sleep 10
+  COUNTER=$((COUNTER + 1))
+done
 ''')
 base_server_state = Definition("./scripts/server-state.sh", make_executable=True, text='''#!/bin/bash
 set -e
@@ -4755,6 +4804,47 @@ resource "aws_ses_domain_dkim" "ses_domain_dkim" {
 }
 ''')
 
+acm_certificates_module = Definition("infrastructure/main.tf", append=True, text='''
+module "acm_certificates" {
+  source = "./acm_certificates"
+
+  domains = [
+    # "www.example.org",
+  ]
+}
+''')
+
+acm_certificates_definition = Definition("infrastructure/acm_certificates/certificates.tf", append=True, text='''
+variable "domains" { type = list(string) }
+
+resource "aws_acm_certificate" "acm_cert" {
+  for_each          = toset(var.domains)
+  domain_name       = each.value
+  validation_method = "DNS"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "null_resource" "await_acm_validation" {
+  for_each = toset(var.domains)
+
+  provisioner "local-exec" {
+    command = "./tools/await-acm-approval.sh '${aws_acm_certificate.acm_cert[each.key].arn}'"
+  }
+
+  lifecycle {
+    replace_triggered_by = [aws_acm_certificate.acm_cert]
+  }
+}
+
+output "acm_cert_arns" {
+  value = { for domain, cert in aws_acm_certificate.acm_cert : domain => cert.arn }
+  depends_on = [null_resource.await_acm_validation]
+}
+''')
+
 
 
 
@@ -4781,7 +4871,7 @@ infra_base_template = TemplateDefinition('{infra_name} infra', {
   base_create_keys,
   base_trigger_codebuild,
   base_deploy,
-  base_server_state,
+  # base_server_state,
   base_ssh_into,
   base_ssm_into,
   base_test_sh,
@@ -5413,6 +5503,15 @@ and add the following permission to your lambda:
 },
 ''')
 
+acm_certificates_template = TemplateDefinition('acm certificates', {}, [
+  base_await_acm_approval,
+  acm_certificates_module,
+  acm_certificates_definition,
+], '''
+Add all of your required domains into the `main.tf` variables.
+Remember that this doesn't validate the certificates, you have to do that yourself.
+''')
+
 
 ####################################################################################################
 # main
@@ -5444,6 +5543,7 @@ def main():
   parser.add_argument('--lambda-schedule-event', nargs=1, help='creates an eventbridge job that triggers lambda on a schedule;\t stonemill --lambda-schedule-event my_lambda')
   parser.add_argument('--githubactions-deploy', nargs=2, help='creates the deployment workflows for github actions to push the terraform infrastructure;\t stonemill --githubactions-deploy "arn:aws:iam::123456789012:role/GithubActionsAccessRole" "tfstate-abcdef0123456789"\n\t follow this guide for how to create your role and secure it to only allow github access: https://benoitboure.com/securely-access-your-aws-resources-from-github-actions')
   parser.add_argument('--ses-domain', action='store_true', help='creates the DKIM records to start the validation process for an SES domain;\t stonemill --ses-domain')
+  parser.add_argument('--acm-certificates', action='store_true', help='creates ACM certificate requests for every listed domain;\t stonemill --acm-certificates')
   args = parser.parse_args()
 
   if args.infra_base:
@@ -5537,6 +5637,10 @@ def main():
   elif args.ses_domain:
     template_args = ses_domain_template.parse_arguments()
     ses_domain_template.mill_template(template_args)
+
+  elif args.acm_certificates:
+    template_args = acm_certificates_template.parse_arguments()
+    acm_certificates_template.mill_template(template_args)
 
   else:
     parser.print_help()
