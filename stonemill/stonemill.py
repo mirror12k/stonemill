@@ -488,8 +488,11 @@ usage() {
     echo "       -autodeploy     Deploy the infrastructure without manual confirmation"
     echo "       -destroy        Destroy the infrastructure"
     echo "       -prod           Set the stage to production"
+    echo "       -refresh        Initialize the infrastructure if it is already deployed"
     exit 1
 }
+
+EXTRA_ARGUMENTS=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -509,6 +512,11 @@ while [ "$#" -gt 0 ]; do
             STAGE="prod"
             shift
             ;;
+        -refresh)
+            ACTION="refresh"
+            shift
+            EXTRA_ARGUMENTS="$EXTRA_ARGUMENTS -reconfigure"
+            ;;
         *)
             usage
             ;;
@@ -523,7 +531,7 @@ fi
 cd infrastructure
 
 echo "[i] running init"
-terraform init "-backend-config=config/backend-config.$STAGE.hcl"
+terraform init "-backend-config=config/backend-config.$STAGE.hcl" $EXTRA_ARGUMENTS
 
 case "$ACTION" in
     deploy)
