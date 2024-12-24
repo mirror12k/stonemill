@@ -5362,7 +5362,7 @@ ECR image template added to {lambda_name}...
 
 In your `infrastructure/main.tf`, add the following variable to your lambda module:
 ```
-  lambda_image_repo_url = module.{lambda_name}_image
+  lambda_image_repo_url = module.{lambda_name}_image.repository_url
 ```
 
 And in your `infrastructure/{lambda_name}/{lambda_name}.tf`, replace `runtime,handler,filename,source_code_hash` with:
