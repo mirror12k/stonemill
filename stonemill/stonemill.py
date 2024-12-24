@@ -704,7 +704,7 @@ resource "aws_lambda_function" "lambda_function" {
   function_name = "${local.fullname}"
   publish = true
 
-  runtime = "python3.8"
+  runtime = "python3.12"
   handler = "main.lambda_handler"
 
   filename = var.lambda_build_path
