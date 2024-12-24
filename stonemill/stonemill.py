@@ -983,7 +983,7 @@ botocore
 pyjwt
 ''')
 base_lambda_test = Definition("scripts/test.sh", append=True, text='''
-INVOKE_FUNCTION_NAME=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{lambda_name}}_name.value')
+INVOKE_FUNCTION_NAME=$(terraform -chdir=infrastructure output -json | jq -r '.{{lambda_name}}_name.value')
 echo "invoking lambda: $INVOKE_FUNCTION_NAME"
 aws lambda invoke --region us-east-1 \\
     --function-name $INVOKE_FUNCTION_NAME \\
@@ -1065,7 +1065,7 @@ output "sqs_queue_arn" { value = aws_sqs_queue.input_queue.arn }
 output "sqs_queue_url" { value = aws_sqs_queue.input_queue.url }
 ''')
 sqs_lambda_test = Definition("scripts/test.sh", append=True, text='''
-SQS_URL=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{lambda_name}}_sqs_queue_url.value')
+SQS_URL=$(terraform -chdir=infrastructure output -json | jq -r '.{{lambda_name}}_sqs_queue_url.value')
 aws sqs send-message --region us-east-1 --queue-url "$SQS_URL" --message-body "{\"action\":\"/{{lambda_name}}/hello\"}"
 ''')
 
@@ -1163,7 +1163,7 @@ resource "aws_lambda_permission" "apigw_permission" {
 output "api_url" { value = "${aws_apigatewayv2_stage.gateway_stage.invoke_url}" }
 ''')
 api_lambda_test = Definition("scripts/test.sh", append=True, text='''
-INVOKE_URL=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{lambda_name}}_api_url.value')
+INVOKE_URL=$(terraform -chdir=infrastructure output -json | jq -r '.{{lambda_name}}_api_url.value')
 echo "invoking api: $INVOKE_URL"
 curl -X POST "$INVOKE_URL/{{lambda_name}}/hello" -H 'content-type: application/json' -d '{"msg":"working as intended"}'
 ''')
@@ -1438,7 +1438,7 @@ pyjwt
 graphene
 ''')
 graphql_lambda_test = Definition("scripts/test.sh", append=True, text='''
-INVOKE_URL=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{lambda_name}}_api_url.value')
+INVOKE_URL=$(terraform -chdir=infrastructure output -json | jq -r '.{{lambda_name}}_api_url.value')
 echo "invoking api: $INVOKE_URL"
 curl -X POST "$INVOKE_URL" -H 'content-type: application/json' -d '{"query":"{ hello login(email:\"asdf\", password:\"asdf\") }"}'
 ''')
@@ -1594,7 +1594,7 @@ usermanager_lambda_requirements = Definition("src/{{lambda_name}}/requirements.t
 pynamodb
 ''')
 usermanager_lambda_test = Definition("scripts/test.sh", append=True, text='''
-INVOKE_URL=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.usermanager_lambda_api_url.value')
+INVOKE_URL=$(terraform -chdir=infrastructure output -json | jq -r '.usermanager_lambda_api_url.value')
 echo "invoking api: $INVOKE_URL"
 curl -X POST "$INVOKE_URL" -H 'content-type: application/json' -H "authorization: $token" -d '{"query":"{ addUser(email:\"qwer\", password:\"asdf\") }"}'
 # curl -X POST "$INVOKE_URL" -H 'content-type: application/json' -H "authorization: $token" -d '{"query":"{ login(email:\"qwer\", password:\"asdf\") }"}'
@@ -1789,7 +1789,7 @@ class Mutation(ObjectType):
 schema = Schema(query=Query, mutation=Mutation)
 ''')
 crud_lambda_test = Definition("scripts/test.sh", append=True, text='''
-INVOKE_URL=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.usermanager_lambda_api_url.value')
+INVOKE_URL=$(terraform -chdir=infrastructure output -json | jq -r '.usermanager_lambda_api_url.value')
 echo "invoking api: $INVOKE_URL"
 token=$(curl -s -X POST "$INVOKE_URL" -H 'content-type: application/json' -H "authorization: $token" -d '{"query":"{ login(email:\"asdf\", password:\"asdf\") }"}' | jq -r '.data.login')
 curl -X POST "$INVOKE_URL" -H 'content-type: application/json' -H "authorization: $token" -d '{"query":"{ addUserDashboard(content:\"hello\") }"}'
@@ -1948,7 +1948,7 @@ def verify_token(data, event):
     return { 'success': False, 'error': 'invalid token' }
 ''')
 authn_lambda_test = Definition("scripts/test.sh", append=True, text='''
-INVOKE_FUNCTION_NAME=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{lambda_name}}_name.value')
+INVOKE_FUNCTION_NAME=$(terraform -chdir=infrastructure output -json | jq -r '.{{lambda_name}}_name.value')
 aws lambda invoke --region us-east-1 \\
     --function-name "$INVOKE_FUNCTION_NAME" \\
     --payload $(echo '{"rawPath":"/v1/authn_lambda/sign_token","body":"{\\"id\\":\\"asdf\\"}"}' | base64 -w 0) \\
@@ -2871,7 +2871,7 @@ export default Home
 ''')
 website_s3_styles_css = Definition("src/{{website_name}}/public/css/styles.css", text='''''')
 website_s3_test = Definition("scripts/test.sh", append=True, text='''
-WEBSITE_URL=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{website_name}}_endpoint.value')
+WEBSITE_URL=$(terraform -chdir=infrastructure output -json | jq -r '.{{website_name}}_endpoint.value')
 echo "website endpoint: $WEBSITE_URL"
 curl "$WEBSITE_URL"
 ''')
@@ -4438,7 +4438,7 @@ EOF
 }
 ''')
 dynamodb_table_test = Definition("scripts/test.sh", append=True, text='''
-TABLE_ID=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{table_name}}_table_id.value')
+TABLE_ID=$(terraform -chdir=infrastructure output -json | jq -r '.{{table_name}}_table_id.value')
 echo "table id: $TABLE_ID"
 
 # insert/update an item
@@ -4631,7 +4631,7 @@ output "bucket_id" { value = aws_s3_bucket.data_bucket.id }
 ''')
 
 firehose_s3_test = Definition("scripts/test.sh", append=True, text='''
-FIREHOSE_STREAM_NAME=$(cat infrastructure/terraform.tfstate | jq -r '.outputs.{{firehose_name}}_stream_name.value')
+FIREHOSE_STREAM_NAME=$(terraform -chdir=infrastructure output -json | jq -r '.{{firehose_name}}_stream_name.value')
 echo "putting event into firehose: $FIREHOSE_STREAM_NAME"
 aws firehose put-record --region us-east-1 --delivery-stream-name $FIREHOSE_STREAM_NAME --record '{"Data":"SGVsbG8gd29ybGQhCg=="}'
 
