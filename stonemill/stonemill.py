@@ -603,10 +603,12 @@ base_server_state = Definition("./scripts/server-state.sh", make_executable=True
 set -e
 cd "$(dirname "$0")" && cd ..
 
-INSTANCE_ID=$(cat "infrastructure/terraform.tfstate" | jq -r ".outputs.instance_id.value")
+INSTANCE_NAME=$1
+
+INSTANCE_ID=$(terraform -chdir=infrastructure output -json | jq -r ".${INSTANCE_NAME}_instance_id.value")
 echo "INSTANCE_ID: $INSTANCE_ID"
 
-ACTION=$1
+ACTION=$2
 if [[ "$ACTION" == "stop" ]]; then
   echo "[i] running stop..."
   aws ec2 stop-instances --region us-east-1 --instance-ids "$INSTANCE_ID"
@@ -628,7 +630,7 @@ if [ "$INSTANCE_NAME" = "" ]; then
 fi
 
 echo "[+] getting instance ip from infrastructure..."
-INSTANCE_ID=$(cat "infrastructure/terraform.tfstate" | jq -r ".outputs.${INSTANCE_NAME}_instance_id.value")
+INSTANCE_ID=$(terraform -chdir=infrastructure output -json | jq -r ".${INSTANCE_NAME}_instance_id.value")
 
 echo "INSTANCE_ID: $INSTANCE_ID"
 INSTANCE_IP=$(aws ec2 describe-instances --region "us-east-1" \\
@@ -654,6 +656,14 @@ if [ "$INSTANCE_ID" = "null" ]; then echo "[!] instance id not found for name '$
 
 echo "[+] logging in to ssm: $INSTANCE_ID"
 aws ssm start-session --target "$INSTANCE_ID" --reason "manual login" --region us-east-1 --document-name AWS-StartInteractiveCommand --parameters command="cd /app && sudo su ubuntu"
+''')
+base_lambda_log = Definition("./scripts/lambda-log.sh", make_executable=True, text='''#!/bin/bash
+cd "$(dirname "$0")" && cd ..
+
+LAMBDA_NAME=$1
+FUNCTION_NAME=$(terraform -chdir=infrastructure output -json | jq -r ".${LAMBDA_NAME}_name.value")
+echo "--- tailing lambda: $FUNCTION_NAME ---"
+aws logs tail "/aws/lambda/$FUNCTION_NAME" --follow --region us-east-1
 ''')
 
 base_gitignore = Definition("./.gitignore", text='''build
@@ -4874,6 +4884,7 @@ infra_base_template = TemplateDefinition('{infra_name} infra', {
   # base_server_state,
   base_ssh_into,
   base_ssm_into,
+  base_lambda_log,
   base_test_sh,
   base_gitignore,
 ], '''
